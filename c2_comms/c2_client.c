@@ -668,7 +668,7 @@ aegis_result_t aegis_c2_beacon(aegis_c2_ctx_t *ctx, uint8_t *task_out,
 
   aegis_result_t rc =
       aegis_encrypt(ctx->crypto, fp_buf, fp_len, (const uint8_t *)&env,
-                    sizeof(env) - AEGIS_GCM_IV_BYTES - AEGIS_GCM_TAG_BYTES,
+                    sizeof(env),
                     ct_buf, env.iv, env.tag);
   if (rc != AEGIS_OK) {
     ctx->consecutive_failures++;
@@ -770,9 +770,13 @@ aegis_result_t aegis_c2_beacon(aegis_c2_ctx_t *ctx, uint8_t *task_out,
       size_t resp_ct_len = resp_env->payload_len;
 
       if (resp_ct_len <= task_cap) {
-        rc = aegis_decrypt(ctx->crypto, resp_ct, resp_ct_len, body,
-                           sizeof(aegis_c2_envelope_t) - AEGIS_GCM_IV_BYTES -
-                               AEGIS_GCM_TAG_BYTES,
+        aegis_c2_envelope_t aad_env;
+        memcpy(&aad_env, resp_env, sizeof(aegis_c2_envelope_t));
+        memset(aad_env.iv, 0, AEGIS_GCM_IV_BYTES);
+        memset(aad_env.tag, 0, AEGIS_GCM_TAG_BYTES);
+
+        rc = aegis_decrypt(ctx->crypto, resp_ct, resp_ct_len, (const uint8_t *)&aad_env,
+                           sizeof(aegis_c2_envelope_t),
                            resp_env->iv, resp_env->tag, task_out);
         if (rc == AEGIS_OK)
           *task_len = resp_ct_len;
@@ -904,7 +908,16 @@ aegis_result_t aegis_c2_fetch_stage(aegis_c2_ctx_t *ctx, uint8_t **stage_out,
     return AEGIS_ERR_ALLOC;
   }
 
-  rc = aegis_decrypt(ctx->crypto, stage_ct, stage_ct_len, body,
+  /*
+   * The server generated the AAD over an envelope where IV and TAG were zeroed out!
+   * We must recreate that precise mathematical state to verify the tag.
+   */
+  aegis_c2_envelope_t aad_env;
+  memcpy(&aad_env, resp_env, sizeof(aegis_c2_envelope_t));
+  memset(aad_env.iv, 0, AEGIS_GCM_IV_BYTES);
+  memset(aad_env.tag, 0, AEGIS_GCM_TAG_BYTES);
+
+  rc = aegis_decrypt(ctx->crypto, stage_ct, stage_ct_len, (const uint8_t *)&aad_env,
                      sizeof(aegis_c2_envelope_t), resp_env->iv, resp_env->tag,
                      *stage_out);
 
@@ -1249,7 +1262,12 @@ aegis_result_t aegis_c2_fetch_resource(aegis_c2_ctx_t *ctx,
     return AEGIS_ERR_ALLOC;
   }
 
-  rc = aegis_decrypt(ctx->crypto, res_ct, res_ct_len, body,
+  aegis_c2_envelope_t aad_env;
+  memcpy(&aad_env, resp_env, sizeof(aegis_c2_envelope_t));
+  memset(aad_env.iv, 0, AEGIS_GCM_IV_BYTES);
+  memset(aad_env.tag, 0, AEGIS_GCM_TAG_BYTES);
+
+  rc = aegis_decrypt(ctx->crypto, res_ct, res_ct_len, (const uint8_t *)&aad_env,
                      sizeof(aegis_c2_envelope_t), resp_env->iv, resp_env->tag,
                      *res_out);
 
